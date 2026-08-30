@@ -150,14 +150,33 @@ export class DeGiroConverterV3 extends AbstractConverter {
             continue;
           }
 
+          // Look ahead in the remaining records if there is one with the same orderId.
+          let matchingRecord = this.findMatchByOrderId(record, records.slice(idx + 1));
+
+          // If there was no match by orderId, and there was no orderId present on the current record, look ahead in the remaining records to find a match by ISIN + Product.
+          if (!matchingRecord && !record.orderId) {
+            matchingRecord = this.findMatchByIsin(record, records.slice(idx + 1));
+          }
+
+          // When the current record is a fee/tax row paired with a buy/sell, use the
+          // buy/sell record's currency for the security lookup. Otherwise a fee row in
+          // EUR paired with a USD Achat would poison the lookup and match the wrong
+          // exchange-suffixed variant (e.g. ELFA.DE instead of ELF for US26856L1035).
+          let securityLookupRecord = record;
+          if (matchingRecord && this.isBuyOrSellRecordSet(record, matchingRecord)) {
+            if (this.isBuyOrSellRecord(matchingRecord)) {
+              securityLookupRecord = matchingRecord;
+            }
+          }
+
           // Look for the security for the current record.
           let security: YahooFinanceRecord;
           try {
             security = await this.securityService.getSecurity(
-              record.isin,
+              securityLookupRecord.isin,
               null,
-              record.product,
-              record.currency,
+              securityLookupRecord.product,
+              securityLookupRecord.currency,
               this.progress);
           }
           catch (err) {
@@ -170,14 +189,6 @@ export class DeGiroConverterV3 extends AbstractConverter {
             this.progress.log(`[i] No result found for ${record.isin || record.product} with currency ${record.currency}! Please add this manually..\n`);
             bar1.increment();
             continue;
-          }
-
-          // Look ahead in the remaining records if there is one with the samen orderId.
-          let matchingRecord = this.findMatchByOrderId(record, records.slice(idx + 1));
-
-          // If there was no match by orderId, and there was no orderId present on the current record, look ahead in the remaining records to find a match by ISIN + Product.
-          if (!matchingRecord && !record.orderId) {
-            matchingRecord = this.findMatchByIsin(record, records.slice(idx + 1));
           }
 
           // If it's a standalone record, add it immediately.
