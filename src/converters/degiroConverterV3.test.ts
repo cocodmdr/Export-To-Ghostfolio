@@ -264,6 +264,51 @@ describe("degiroConverterV3", () => {
     }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
   });
 
+  it("should not let EUR fee row poison the security lookup for a USD BUY (ELF Beauty case)", (done) => {
+
+    // Arrange: Real-world CSV shape. Fee row is in EUR, Achat is in USD.
+    // Yahoo returns a single quote for the ISIN. If we pass EUR (from the fee row)
+    // as the expected currency, we may match a wrong exchange-suffixed variant.
+    // The security lookup for a buy/sell record set must use the buy/sell row's
+    // currency (USD), not the fee row's currency (EUR).
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `21-02-2024,15:30,21-02-2024,"E.L.F. BEAUTY, INC.",US26856L1035,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-2,00",EUR,"1988,52",889bf2bb-f2b0-4347-8024-394ea9f97f73\n`;
+    tempFileContent += `21-02-2024,15:30,21-02-2024,"E.L.F. BEAUTY, INC.",US26856L1035,"Achat 12 e.l.f. Beauty, Inc.@170,14 USD (US26856L1035)",,USD,"-2041,68",USD,"174,19",889bf2bb-f2b0-4347-8024-394ea9f97f73`;
+
+    const yahooMock = new YahooFinanceServiceMock();
+    // Yahoo returns two quotes for the ISIN:
+    //   - EUR/Xetra 'ELFA.DE' (Deka ETF, wrong)
+    //   - USD/NYSE 'ELF' (correct)
+    // Before the fix, the fee row (EUR) is processed first and picks ELFA.DE via
+    // currency match, poisoning the cache. The USD Achat then inherits ELFA.DE.
+    // After the fix, the security lookup for a buy/sell record set uses the buy/sell
+    // row's currency (USD), so 'ELF' is selected.
+    (yahooMock as any).search = async () => ({ quotes: [
+      { symbol: "ELFA.DE", longname: "Deka EURO STOXX 50 ESG Filtered UCITS ETF" },
+      { symbol: "ELF", longname: "e.l.f. Beauty, Inc." }
+    ] });
+    (yahooMock as any).quoteSummary = async (sym: string) => {
+      if (sym === "ELFA.DE") return { price: { symbol: "ELFA.DE", currency: "EUR", exchange: "GER", regularMarketPrice: 20 } };
+      return { price: { symbol: "ELF", currency: "USD", exchange: "NYQ", regularMarketPrice: 170 } };
+    };
+
+    const sut = new DeGiroConverterV3(new SecurityService(yahooMock));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: BUY must adopt the USD/NYSE symbol, not the EUR/Xetra one.
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(buys.length).toBe(1);
+      expect(buys[0].currency).toBe("USD");
+      expect(buys[0].symbol).toBe("ELF");
+      expect(buys[0].symbol).not.toBe("ELFA.DE");
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
   it("should log error and invoke errorCallback when an error occurs in processFileContents", (done) => {
    
     // Arrange
