@@ -603,6 +603,46 @@ describe("securityService", () => {
             expect(cache[2]).toBe(0);
         });
 
+        it("prefers primary listing over ISIN-as-symbol exchange-suffixed variant when currencies match (SNOW / US8334451098)", async () => {
+
+            // Arrange: Yahoo search for Snowflake ISIN returns both the Stuttgart-listed
+            // variant using the ISIN as ticker (US8334451098.SG) AND the primary NASDAQ
+            // listing (SNOW). Both quote in USD. Currently the service returns whichever
+            // matches currency first, which yields the useless ISIN.SG symbol.
+            const yahooFinanceMock = new YahooFinanceServiceMock();
+            jest.spyOn(yahooFinanceMock, "search").mockResolvedValue({
+                quotes: [
+                    { symbol: "US8334451098.SG" },
+                    { symbol: "SNOW" }
+                ]
+            });
+            jest.spyOn(yahooFinanceMock, "quoteSummary")
+                .mockResolvedValueOnce({
+                    price: {
+                        regularMarketPrice: 150,
+                        currency: "USD",
+                        exchange: "STU",
+                        symbol: "US8334451098.SG"
+                    }
+                })
+                .mockResolvedValueOnce({
+                    price: {
+                        regularMarketPrice: 150,
+                        currency: "USD",
+                        exchange: "NMS",
+                        symbol: "SNOW"
+                    }
+                });
+
+            // Act
+            const sut = new SecurityService(yahooFinanceMock);
+            const result = await sut.getSecurity("US8334451098", null, null, "USD");
+
+            // Assert
+            expect(result).toBeTruthy();
+            expect(result.symbol).toBe("SNOW");
+        });
+
         it("restores ISIN overrides from file, if it was present", async () => {
 
             // Arrange
