@@ -289,7 +289,7 @@ export class DeGiroConverterV3 extends AbstractConverter {
 
   private findMatchByOrderId(currentRecord: DeGiroRecord, records: DeGiroRecord[]): DeGiroRecord | undefined {
     return records.find(r => r.orderId === currentRecord.orderId
-      && dayjs(r.date).isSame(dayjs(currentRecord.date), 'day')
+      && dayjs(r.date, "DD-MM-YYYY").isSame(dayjs(currentRecord.date, "DD-MM-YYYY"), 'day')
       && !this.isIgnoredRecord(r)
     );
   }
