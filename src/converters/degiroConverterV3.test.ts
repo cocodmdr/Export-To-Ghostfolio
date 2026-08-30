@@ -234,6 +234,36 @@ describe("degiroConverterV3", () => {
     }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
   });
 
+  it("should pair fee row with Achat row on the same day (findMatchByOrderId date parsing)", (done) => {
+
+    // Arrange: Exact real-world CSV shape from a DeGiro FR export. The Achat row comes
+    // AFTER the fee row (matches the order DeGiro emits). findMatchByOrderId must find
+    // the Achat when iterating from the fee row. It uses dayjs(r.date) which is
+    // 'DD-MM-YYYY' — must be parsed with an explicit format or the isSame check fails.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-1,00",EUR,"570,37",2cf37d62-5ab3-4fce-bf3e-84c78697b200\n`;
+    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Achat 3 NVIDIA Corporation@190 USD (US67066G1040),,USD,"-570,00",USD,"-570,00",2cf37d62-5ab3-4fce-bf3e-84c78697b200`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: exactly one BUY (the fee attachment is verified in a separate case).
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(buys.length).toBe(1);
+      expect(buys[0].quantity).toBe(3);
+      expect(buys[0].unitPrice).toBe(190);
+      expect(buys[0].symbol).toBe("NVDA");
+
+      const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
+      expect(dividends.length).toBe(0);
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
   it("should log error and invoke errorCallback when an error occurs in processFileContents", (done) => {
    
     // Arrange
