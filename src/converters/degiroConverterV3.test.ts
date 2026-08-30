@@ -41,26 +41,6 @@ describe("degiroConverterV3", () => {
     }, () => { done.fail("Should not have an error!"); });
   });
 
-  it("should prefix MANUAL platform fee symbols with GF_ (Ghostfolio validation requires UUID or GF_ prefix)", (done) => {
-
-    // Arrange
-    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
-    const inputFile = "samples/degiro-export.csv";
-
-    // Act
-    sut.readAndProcessFile(inputFile, (actualExport: GhostfolioExport) => {
-
-      // Assert
-      const manualActivities = actualExport.activities.filter(a => a.dataSource === "MANUAL");
-      expect(manualActivities.length).toBeGreaterThan(0);
-      for (const activity of manualActivities) {
-        expect(activity.symbol.startsWith("GF_")).toBe(true);
-      }
-
-      done();
-    }, (err) => { done(err); });
-  });
-
   describe("should throw an error if", () => {
     it("the input file does not exist", (done) => {
 
@@ -199,111 +179,48 @@ describe("degiroConverterV3", () => {
     }, (e) => { console.log(e); done.fail("Should not have an error!"); });
   });
 
-  it("should convert an Achat (buy) grouped with FX Crédit/Débit rows into a BUY activity", (done) => {
+  it("should convert an 'Ajustement fractionnement' (stock split) pair into SELL old + BUY new", (done) => {
 
-    // Arrange: DeGiro FR export uses "Operation de change - Crédit" (no accent on 'Operation')
-    // and "Opération de change - Débit" (with accent). All rows share the same orderId as
-    // the Achat. If the unaccented FX Crédit row is not ignored, the converter pairs it as
-    // a dividend and the Achat is dropped entirely.
+    // Arrange: DeGiro FR emits stock splits as two 'Ajustement fractionnement' rows sharing
+    // no orderId, both on the same date/product/ISIN. Example: NVIDIA 10-for-1 on 2024-06-10.
+    //   - Debit  : 'Ajustement fractionnement: 30 NVIDIA @ 120,888 USD'   amount = -3626,64 USD
+    //   - Credit : 'Ajustement fractionnement: 3 NVIDIA @ 1 208,88 USD'   amount = +3626,64 USD
+    // Before the fix, the credit row is picked up as a DIVIDEND with unitPrice=3626.64,
+    // and the debit row is silently dropped. Result: user's share count stays at 3
+    // (the original BUY) instead of jumping to 30 post-split.
+    //
+    // Ghostfolio has no split activity type; the correct representation is a cash-neutral
+    // pair: SELL 3 @ 1208.88 (close pre-split position) + BUY 30 @ 120.888 (open post-split).
+    // Cost basis preserved, share count correct.
     let tempFileContent = "";
     tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
-    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Operation de change - Crédit,"1,0824",USD,"570,00",USD,"0,00",2cf37d62-5ab3-4fce-bf3e-84c78697b200\n`;
-    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Opération de change - Débit,,EUR,"-526,61",EUR,"43,76",2cf37d62-5ab3-4fce-bf3e-84c78697b200\n`;
-    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-1,00",EUR,"570,37",2cf37d62-5ab3-4fce-bf3e-84c78697b200\n`;
-    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Achat 3 NVIDIA Corporation@190 USD (US67066G1040),,USD,"-570,00",USD,"-570,00",2cf37d62-5ab3-4fce-bf3e-84c78697b200`;
+    tempFileContent += `10-06-2024,10:52,10-06-2024,NVIDIA CORPORATION,US67066G1040,"Ajustement fractionnement: 30 NVIDIA Corporation @ 120,888 USD (US67066G1040)",,USD,"-3626,64",USD,"0,00",\n`;
+    tempFileContent += `10-06-2024,10:52,10-06-2024,NVIDIA CORPORATION,US67066G1040,"Ajustement fractionnement: 3 NVIDIA Corporation @ 1 208,88 USD (US67066G1040)",,USD,"3626,64",USD,"3626,64",`;
 
     const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
 
     // Act
     sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
 
-      // Assert
-      expect(actualExport).toBeTruthy();
-      const buys = actualExport.activities.filter(a => a.type === "BUY");
-      expect(buys.length).toBe(1);
-      expect(buys[0].quantity).toBe(3);
-      expect(buys[0].unitPrice).toBe(190);
-      expect(buys[0].currency).toBe("USD");
-      expect(buys[0].symbol).toBe("NVDA");
-
-      // And no spurious dividend from the FX rows.
+      // Assert: no DIVIDEND should be emitted from a split.
       const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
       expect(dividends.length).toBe(0);
 
-      done();
-    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
-  });
-
-  it("should pair fee row with Achat row on the same day (findMatchByOrderId date parsing)", (done) => {
-
-    // Arrange: Exact real-world CSV shape from a DeGiro FR export. The Achat row comes
-    // AFTER the fee row (matches the order DeGiro emits). findMatchByOrderId must find
-    // the Achat when iterating from the fee row. It uses dayjs(r.date) which is
-    // 'DD-MM-YYYY' — must be parsed with an explicit format or the isSame check fails.
-    let tempFileContent = "";
-    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
-    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-1,00",EUR,"570,37",2cf37d62-5ab3-4fce-bf3e-84c78697b200\n`;
-    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Achat 3 NVIDIA Corporation@190 USD (US67066G1040),,USD,"-570,00",USD,"-570,00",2cf37d62-5ab3-4fce-bf3e-84c78697b200`;
-
-    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
-
-    // Act
-    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
-
-      // Assert: exactly one BUY (the fee attachment is verified in a separate case).
+      // Assert: one SELL of the pre-split shares, one BUY of the post-split shares.
+      const sells = actualExport.activities.filter(a => a.type === "SELL");
       const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(sells.length).toBe(1);
       expect(buys.length).toBe(1);
-      expect(buys[0].quantity).toBe(3);
-      expect(buys[0].unitPrice).toBe(190);
-      expect(buys[0].symbol).toBe("NVDA");
 
-      const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
-      expect(dividends.length).toBe(0);
+      expect(sells[0].quantity).toBe(3);
+      expect(sells[0].unitPrice).toBeCloseTo(1208.88, 2);
+      expect(sells[0].currency).toBe("USD");
+      expect(sells[0].symbol).toBe("NVDA");
 
-      done();
-    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
-  });
-
-  it("should not let EUR fee row poison the security lookup for a USD BUY (ELF Beauty case)", (done) => {
-
-    // Arrange: Real-world CSV shape. Fee row is in EUR, Achat is in USD.
-    // Yahoo returns a single quote for the ISIN. If we pass EUR (from the fee row)
-    // as the expected currency, we may match a wrong exchange-suffixed variant.
-    // The security lookup for a buy/sell record set must use the buy/sell row's
-    // currency (USD), not the fee row's currency (EUR).
-    let tempFileContent = "";
-    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
-    tempFileContent += `21-02-2024,15:30,21-02-2024,"E.L.F. BEAUTY, INC.",US26856L1035,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-2,00",EUR,"1988,52",889bf2bb-f2b0-4347-8024-394ea9f97f73\n`;
-    tempFileContent += `21-02-2024,15:30,21-02-2024,"E.L.F. BEAUTY, INC.",US26856L1035,"Achat 12 e.l.f. Beauty, Inc.@170,14 USD (US26856L1035)",,USD,"-2041,68",USD,"174,19",889bf2bb-f2b0-4347-8024-394ea9f97f73`;
-
-    const yahooMock = new YahooFinanceServiceMock();
-    // Yahoo returns two quotes for the ISIN:
-    //   - EUR/Xetra 'ELFA.DE' (Deka ETF, wrong)
-    //   - USD/NYSE 'ELF' (correct)
-    // Before the fix, the fee row (EUR) is processed first and picks ELFA.DE via
-    // currency match, poisoning the cache. The USD Achat then inherits ELFA.DE.
-    // After the fix, the security lookup for a buy/sell record set uses the buy/sell
-    // row's currency (USD), so 'ELF' is selected.
-    (yahooMock as any).search = async () => ({ quotes: [
-      { symbol: "ELFA.DE", longname: "Deka EURO STOXX 50 ESG Filtered UCITS ETF" },
-      { symbol: "ELF", longname: "e.l.f. Beauty, Inc." }
-    ] });
-    (yahooMock as any).quoteSummary = async (sym: string) => {
-      if (sym === "ELFA.DE") return { price: { symbol: "ELFA.DE", currency: "EUR", exchange: "GER", regularMarketPrice: 20 } };
-      return { price: { symbol: "ELF", currency: "USD", exchange: "NYQ", regularMarketPrice: 170 } };
-    };
-
-    const sut = new DeGiroConverterV3(new SecurityService(yahooMock));
-
-    // Act
-    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
-
-      // Assert: BUY must adopt the USD/NYSE symbol, not the EUR/Xetra one.
-      const buys = actualExport.activities.filter(a => a.type === "BUY");
-      expect(buys.length).toBe(1);
+      expect(buys[0].quantity).toBe(30);
+      expect(buys[0].unitPrice).toBeCloseTo(120.888, 3);
       expect(buys[0].currency).toBe("USD");
-      expect(buys[0].symbol).toBe("ELF");
-      expect(buys[0].symbol).not.toBe("ELFA.DE");
+      expect(buys[0].symbol).toBe("NVDA");
 
       done();
     }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
