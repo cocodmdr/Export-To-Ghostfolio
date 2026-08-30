@@ -41,6 +41,26 @@ describe("degiroConverterV3", () => {
     }, () => { done.fail("Should not have an error!"); });
   });
 
+  it("should prefix MANUAL platform fee symbols with GF_ (Ghostfolio validation requires UUID or GF_ prefix)", (done) => {
+
+    // Arrange
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+    const inputFile = "samples/degiro-export.csv";
+
+    // Act
+    sut.readAndProcessFile(inputFile, (actualExport: GhostfolioExport) => {
+
+      // Assert
+      const manualActivities = actualExport.activities.filter(a => a.dataSource === "MANUAL");
+      expect(manualActivities.length).toBeGreaterThan(0);
+      for (const activity of manualActivities) {
+        expect(activity.symbol.startsWith("GF_")).toBe(true);
+      }
+
+      done();
+    }, (err) => { done(err); });
+  });
+
   describe("should throw an error if", () => {
     it("the input file does not exist", (done) => {
 
@@ -177,6 +197,41 @@ describe("degiroConverterV3", () => {
 
       done();
     }, (e) => { console.log(e); done.fail("Should not have an error!"); });
+  });
+
+  it("should convert an Achat (buy) grouped with FX Crédit/Débit rows into a BUY activity", (done) => {
+
+    // Arrange: DeGiro FR export uses "Operation de change - Crédit" (no accent on 'Operation')
+    // and "Opération de change - Débit" (with accent). All rows share the same orderId as
+    // the Achat. If the unaccented FX Crédit row is not ignored, the converter pairs it as
+    // a dividend and the Achat is dropped entirely.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Operation de change - Crédit,"1,0824",USD,"570,00",USD,"0,00",2cf37d62-5ab3-4fce-bf3e-84c78697b200\n`;
+    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Opération de change - Débit,,EUR,"-526,61",EUR,"43,76",2cf37d62-5ab3-4fce-bf3e-84c78697b200\n`;
+    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-1,00",EUR,"570,37",2cf37d62-5ab3-4fce-bf3e-84c78697b200\n`;
+    tempFileContent += `31-01-2023,16:00,31-01-2023,NVIDIA CORPORATION,US67066G1040,Achat 3 NVIDIA Corporation@190 USD (US67066G1040),,USD,"-570,00",USD,"-570,00",2cf37d62-5ab3-4fce-bf3e-84c78697b200`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert
+      expect(actualExport).toBeTruthy();
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(buys.length).toBe(1);
+      expect(buys[0].quantity).toBe(3);
+      expect(buys[0].unitPrice).toBe(190);
+      expect(buys[0].currency).toBe("USD");
+      expect(buys[0].symbol).toBe("NVDA");
+
+      // And no spurious dividend from the FX rows.
+      const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
+      expect(dividends.length).toBe(0);
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
   });
 
   it("should log error and invoke errorCallback when an error occurs in processFileContents", (done) => {

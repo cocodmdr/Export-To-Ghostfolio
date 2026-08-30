@@ -118,7 +118,7 @@ export class DeGiroConverterV3 extends AbstractConverter {
               currency: record.currency,
               dataSource: "MANUAL",
               date: date.format("YYYY-MM-DDTHH:mm:ssZ"),
-              symbol: record.description,
+              symbol: `GF_${record.description}`,
               tags: getTags()
             });
 
@@ -142,7 +142,7 @@ export class DeGiroConverterV3 extends AbstractConverter {
               currency: record.currency,
               dataSource: "MANUAL",
               date: date.format("YYYY-MM-DDTHH:mm:ssZ"),
-              symbol: record.description,
+              symbol: `GF_${record.description}`,
               tags: getTags()
             });
 
@@ -273,6 +273,7 @@ export class DeGiroConverterV3 extends AbstractConverter {
       "interesse",
       "verrekening promotie",
       "operation de change",
+      "opération de change",
       "versement de fonds",
       "débit",
       "debit",
