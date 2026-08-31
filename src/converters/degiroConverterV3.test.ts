@@ -179,6 +179,111 @@ describe("degiroConverterV3", () => {
     }, (e) => { console.log(e); done.fail("Should not have an error!"); });
   });
 
+  it("should convert an 'Ajustement fractionnement' (stock split) pair into SELL old + BUY new", (done) => {
+
+    // Arrange: DeGiro FR emits stock splits as two 'Ajustement fractionnement' rows sharing
+    // no orderId, both on the same date/product/ISIN. Example: NVIDIA 10-for-1 on 2024-06-10.
+    //   - Debit  : 'Ajustement fractionnement: 30 NVIDIA @ 120,888 USD'   amount = -3626,64 USD
+    //   - Credit : 'Ajustement fractionnement: 3 NVIDIA @ 1 208,88 USD'   amount = +3626,64 USD
+    // Before the fix, the credit row is picked up as a DIVIDEND with unitPrice=3626.64,
+    // and the debit row is silently dropped. Result: user's share count stays at 3
+    // (the original BUY) instead of jumping to 30 post-split.
+    //
+    // Ghostfolio has no split activity type; the correct representation is a cash-neutral
+    // pair: SELL 3 @ 1208.88 (close pre-split position) + BUY 30 @ 120.888 (open post-split).
+    // Cost basis preserved, share count correct.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `10-06-2024,10:52,10-06-2024,NVIDIA CORPORATION,US67066G1040,"Ajustement fractionnement: 30 NVIDIA Corporation @ 120,888 USD (US67066G1040)",,USD,"-3626,64",USD,"0,00",\n`;
+    tempFileContent += `10-06-2024,10:52,10-06-2024,NVIDIA CORPORATION,US67066G1040,"Ajustement fractionnement: 3 NVIDIA Corporation @ 1 208,88 USD (US67066G1040)",,USD,"3626,64",USD,"3626,64",`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: no DIVIDEND should be emitted from a split.
+      const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
+      expect(dividends.length).toBe(0);
+
+      // Assert: one SELL of the pre-split shares, one BUY of the post-split shares.
+      const sells = actualExport.activities.filter(a => a.type === "SELL");
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(sells.length).toBe(1);
+      expect(buys.length).toBe(1);
+
+      expect(sells[0].quantity).toBe(3);
+      expect(sells[0].unitPrice).toBeCloseTo(1208.88, 2);
+      expect(sells[0].currency).toBe("USD");
+      expect(sells[0].symbol).toBe("NVDA");
+
+      expect(buys[0].quantity).toBe(30);
+      expect(buys[0].unitPrice).toBeCloseTo(120.888, 3);
+      expect(buys[0].currency).toBe("USD");
+      expect(buys[0].symbol).toBe("NVDA");
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
+  it("should handle acquisition/merger cash-neutral (Fusion: Achat @ 0) as BUY not SELL — TopBuild/QXO case", (done) => {
+
+    // Arrange: when a company is acquired, DeGiro FR emits a 'Fusion: Achat' row for the
+    // acquirer with amount=0 (the shares are received in exchange, no cash moves).
+    // The record has no orderId. The classifier used a strict `totalAmount < 0` check
+    // to decide BUY vs SELL, so amount=0 defaulted to SELL — turning a 71-share BUY of
+    // the acquirer (QXO) into a phantom SELL 71 and inverting the portfolio position.
+    //
+    // Expected: 'Fusion: Achat N ...' → BUY N of the acquirer at unitPrice 0.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `08-07-2026,13:13,07-07-2026,QXO INC,US82846H4056,Fusion: Achat 71 QXO Inc@0 USD (US82846H4056),,USD,"0,00",USD,"1223,42",`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+    jest.spyOn((sut as any).securityService, "getSecurity").mockImplementation((isin: string) => Promise.resolve({ symbol: isin === "US82846H4056" ? "QXO" : "BLD", currency: "USD" } as any));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: one BUY, zero SELL, quantity 71 (unit price 0 is OK for a cash-neutral merger BUY).
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      const sells = actualExport.activities.filter(a => a.type === "SELL");
+      expect(sells.length).toBe(0);
+      expect(buys.length).toBe(1);
+      expect(buys[0].quantity).toBe(71);
+      expect(buys[0].unitPrice).toBe(0);
+
+      done();
+    }, (e) => { console.error("ERR>", e && (e as any).stack || e); done(new Error("Should not have an error!")); });
+  });
+
+  it("should emit a SELL for 'Rachat: Vente' (buyback/redemption) rows — TopBuild redemption case", (done) => {
+
+    // Arrange: the target-side of a merger emits 'Rachat: Vente N X@price' with a POSITIVE
+    // amount (cash received for the redeemed shares). This must yield SELL N of the target.
+    // Bug: the row was silently paired with an accompanying tax-refund row on the same date
+    // and both were dropped, leaving the phantom acquirer SELL as the only merger-related row.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `08-07-2026,13:02,07-07-2026,TOPBUILD CORP - NON TRADEABLE,US89055F1030,"Rachat: Vente 7 TopBuild Corp - Non tradeable@249,6779 USD (US89055F1030)",,USD,"1747,75",USD,"1747,74",\n`;
+    tempFileContent += `08-07-2026,13:02,07-07-2026,TOPBUILD CORP - NON TRADEABLE,US89055F1030,Impôts sur dividende,,USD,"-524,32",USD,"1223,42",`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+    jest.spyOn((sut as any).securityService, "getSecurity").mockImplementation(() => Promise.resolve({ symbol: "BLD", currency: "USD" } as any));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: exactly one SELL of 7 shares must survive (tax reversal row is unrelated fee/dividend).
+      const sells = actualExport.activities.filter(a => a.type === "SELL");
+      expect(sells.length).toBe(1);
+      expect(sells[0].quantity).toBe(7);
+      expect(sells[0].unitPrice).toBeCloseTo(249.679, 3);
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
   it("should log error and invoke errorCallback when an error occurs in processFileContents", (done) => {
    
     // Arrange
