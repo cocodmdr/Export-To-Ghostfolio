@@ -226,6 +226,69 @@ describe("degiroConverterV3", () => {
     }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
   });
 
+  it("should convert a Dutch 'SPLIT AANPASSING' (stock split) pair into SELL old + BUY new", (done) => {
+
+    // Arrange: DeGiro NL emits stock splits with the same shape as the French export
+    // but a Dutch label 'SPLIT AANPASSING' AND Dutch number formatting (dot thousands,
+    // comma decimals) AND the two legs may be timestamped a few minutes apart. Example:
+    // NVIDIA 10-for-1 on 2024-06-10:
+    //   - Debit  : 'SPLIT AANPASSING: 80 NVIDIA @ 120,888 USD'   amount = -9671,04 USD
+    //   - Credit : 'SPLIT AANPASSING: 8 NVIDIA @ 1.208,88 USD'   amount = +9671,04 USD
+    // Before this fix, the Dutch label was not recognized (fell through as SELL/DIVIDEND),
+    // and even if recognized the '1.208,88' price would be parsed as 1.208.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `10-06-2024,10:52,10-06-2024,NVIDIA CORPORATION,US67066G1040,"SPLIT AANPASSING: 80 NVIDIA Corporation @ 120,888 USD (US67066G1040)",,USD,"-9671,04",USD,"0,00",\n`;
+    tempFileContent += `10-06-2024,10:52,10-06-2024,NVIDIA CORPORATION,US67066G1040,"SPLIT AANPASSING: 8 NVIDIA Corporation @ 1.208,88 USD (US67066G1040)",,USD,"9671,04",USD,"9671,04",`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+      const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
+      expect(dividends.length).toBe(0);
+
+      const sells = actualExport.activities.filter(a => a.type === "SELL");
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(sells.length).toBe(1);
+      expect(buys.length).toBe(1);
+
+      expect(sells[0].quantity).toBe(8);
+      expect(sells[0].unitPrice).toBeCloseTo(1208.88, 2);
+      expect(buys[0].quantity).toBe(80);
+      expect(buys[0].unitPrice).toBeCloseTo(120.888, 3);
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
+  it("should convert a Dutch 'SPLIT AANPASSING' pair whose two legs are minutes apart", (done) => {
+
+    // Arrange: DeGiro NL sometimes timestamps the two legs of a split at slightly
+    // different times (e.g. NVIDIA 4-for-1 on 2021-07-20 at 13:01 and 13:06). Before this
+    // fix the sibling matcher required identical time and would drop both legs, silently
+    // failing to reflect the split.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `20-07-2021,13:06,20-07-2021,NVIDIA CORPORATION,US67066G1040,"SPLIT AANPASSING: 4 NVIDIA Corporation @ 187,7975 USD (US67066G1040)",,USD,"-751,19",USD,"0,00",\n`;
+    tempFileContent += `20-07-2021,13:01,20-07-2021,NVIDIA CORPORATION,US67066G1040,"SPLIT AANPASSING: 1 NVIDIA Corporation @ 751,19 USD (US67066G1040)",,USD,"751,19",USD,"751,19",`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+      const sells = actualExport.activities.filter(a => a.type === "SELL");
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
+
+      expect(dividends.length).toBe(0);
+      expect(sells.length).toBe(1);
+      expect(buys.length).toBe(1);
+      expect(sells[0].quantity).toBe(1);
+      expect(buys[0].quantity).toBe(4);
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
   it("should log error and invoke errorCallback when an error occurs in processFileContents", (done) => {
    
     // Arrange
