@@ -85,16 +85,35 @@ export class DeGiroConverterV3 extends AbstractConverter {
           // Not all exports provide an order ID, so check for a buy/sell marking in those cases.
           // Dividend records never have an order ID, so check for a marking there.
           // If a match was found, skip the record and move next.
-          if (result.activities.findIndex(a =>
+          // Dedup: skip only if we've already emitted an activity for this exact
+          // record (same orderId + same description). This lets partial fills
+          // (multiple Achat rows sharing an orderId+time but different quantities)
+          // each produce their own activity.
+          const recordSignature = record.orderId ? `${record.orderId}|${record.description}` : "";
+          if (recordSignature && result.activities.findIndex(a =>
+            a.comment !== null && a.comment !== "" &&
+            (a.comment === recordSignature || a.comment.includes(recordSignature))
+          ) > -1) {
+
+            bar1.increment();
+            continue;
+          }
+
+          // For records without an orderId (dividends, splits), fall back to the
+          // isin+date+time comment prefix guard — but ONLY for the record type that
+          // uses the corresponding comment prefix. Previously a co-located buy/sell
+          // row (e.g. Rachat: Vente on the same date/isin/time as a dividend tax
+          // reversal) was wrongly deduped by matching the 'Dividend ...' prefix.
+          const isDividendRecord = this.isTransactionFeeRecord(record, false) ||
+            record.description.toLocaleLowerCase().indexOf("dividend") > -1;
+          const isStockSplit = this.isStockSplitRecord(record);
+          if (!record.orderId && result.activities.findIndex(a =>
             a.comment !== null &&
             a.comment !== "" &&
             (
-              a.comment === record.orderId ||
-              a.comment.startsWith(`Buy ${record.isin} @ ${record.date}T`) ||
-              a.comment.startsWith(`Sell ${record.isin} @ ${record.date}T`) ||
-              a.comment.startsWith(`Dividend ${record.isin} @ ${record.date}T`) ||
-              a.comment.startsWith(`Split-sell ${record.isin} @ ${record.date}T`) ||
-              a.comment.startsWith(`Split-buy ${record.isin} @ ${record.date}T`))
+              (isDividendRecord && a.comment.startsWith(`Dividend ${record.isin} @ ${record.date}T`)) ||
+              (isStockSplit && a.comment.startsWith(`Split-sell ${record.isin} @ ${record.date}T`)) ||
+              (isStockSplit && a.comment.startsWith(`Split-buy ${record.isin} @ ${record.date}T`)))
           ) > -1) {
 
             bar1.increment();
@@ -224,7 +243,13 @@ export class DeGiroConverterV3 extends AbstractConverter {
           let matchingRecord = this.findMatchByOrderId(record, records.slice(idx + 1));
 
           // If there was no match by orderId, and there was no orderId present on the current record, look ahead in the remaining records to find a match by ISIN + Product.
-          if (!matchingRecord && !record.orderId) {
+          // But skip this fallback for corporate-action rows (Fusion / Rachat /
+          // Modification instrument). They already have an orderId of “” and are
+          // structurally independent events; pairing them by isin+product with a
+          // co-located tax/dividend row causes mapDividendRecord to be called on
+          // the Vente/Achat row, which then emits its POSITIVE amount as a
+          // phantom DIVIDEND unitPrice.
+          if (!matchingRecord && !record.orderId && !this.isCorporateActionRecord(record)) {
             matchingRecord = this.findMatchByIsin(record, records.slice(idx + 1));
           }
 
@@ -277,9 +302,24 @@ export class DeGiroConverterV3 extends AbstractConverter {
 
             // Check wether it is a buy/sell record set.
             if (this.isBuyOrSellRecordSet(record, matchingRecord)) {
-              result.activities.push(this.combineRecords(record, matchingRecord, security));
+              const activity = this.combineRecords(record, matchingRecord, security);
+              // Tag the emitted activity with signatures for BOTH the current record
+              // and the paired sibling so the dedup guard skips the sibling when its
+              // own iteration comes (prevents double-emitting the Achat as standalone).
+              const currentSig = record.orderId ? `${record.orderId}|${record.description}` : "";
+              const siblingSig = matchingRecord.orderId ? `${matchingRecord.orderId}|${matchingRecord.description}` : "";
+              if (currentSig && siblingSig) {
+                activity.comment = `${currentSig}\n${siblingSig}`;
+              }
+              result.activities.push(activity);
             } else {
-              result.activities.push(this.mapDividendRecord(record, matchingRecord, security));
+              const activity = this.mapDividendRecord(record, matchingRecord, security);
+              const currentSig = record.orderId ? `${record.orderId}|${record.description}` : "";
+              const siblingSig = matchingRecord.orderId ? `${matchingRecord.orderId}|${matchingRecord.description}` : "";
+              if (currentSig && siblingSig) {
+                activity.comment = `${activity.comment}\n${currentSig}\n${siblingSig}`;
+              }
+              result.activities.push(activity);
             }
           }
 
@@ -363,20 +403,49 @@ export class DeGiroConverterV3 extends AbstractConverter {
       "retirada",
       "levantamento de divisa",
       "dito de divisa",
-      "fonds monétaires"];
+      "fonds monétaires",
+      // 'Modification instrument' rows are internal bookkeeping (e.g. a ticker/ISIN
+      // rename or a 'non tradeable' variant swap) that DeGiro emits as a paired
+      // Achat + Vente at price 0. They never move cash or change your real
+      // holdings, so both sides must be ignored to avoid emitting phantom SELL/BUY.
+      "modification instrument"];
 
     return ignoredRecordTypes.some((t) => record.description.toLocaleLowerCase().indexOf(t) > -1);
   }
 
   private findMatchByOrderId(currentRecord: DeGiroRecord, records: DeGiroRecord[]): DeGiroRecord | undefined {
+    // Require a non-empty orderId. Otherwise two unrelated rows both lacking an
+    // orderId would match on `undefined === undefined` and get spuriously paired
+    // (e.g. a dividend-tax reversal getting paired with a corporate-action SELL
+    // that shares the same isin+date+time).
+    if (!currentRecord.orderId) { return undefined; }
     return records.find(r => r.orderId === currentRecord.orderId
       && dayjs(r.date, "DD-MM-YYYY").isSame(dayjs(currentRecord.date, "DD-MM-YYYY"), 'day')
+      && r.time === currentRecord.time
       && !this.isIgnoredRecord(r)
+      // Don't pair two same-side buy/sell rows (partial fills sharing an orderId+time):
+      // each must be emitted as its own activity, otherwise combineRecords or
+      // mapDividendRecord will drop one of them.
+      && !(this.isBuyOrSellRecord(currentRecord) && this.isBuyOrSellRecord(r))
     );
   }
 
   private findMatchByIsin(currentRecord: DeGiroRecord, records: DeGiroRecord[]): DeGiroRecord | undefined {
-    return records.find(r => r.isin === currentRecord.isin && r.product === currentRecord.product);
+    return records.find(r => r.isin === currentRecord.isin && r.product === currentRecord.product
+      // Don't cross-pair a corporate-action share receipt/redemption row with a
+      // co-located dividend/tax row: they share isin+product+date but describe
+      // independent events. Pairing turns a dividend-tax reversal into a phantom
+      // fee on the buy/sell and re-emits the buy/sell as a duplicate standalone.
+      && !(this.isCorporateActionRecord(currentRecord) !== this.isCorporateActionRecord(r))
+    );
+  }
+
+  private isCorporateActionRecord(record: DeGiroRecord): boolean {
+    if (!record || !record.description) { return false; }
+    const desc = record.description.toLocaleLowerCase();
+    return desc.startsWith("fusion") ||
+      desc.startsWith("rachat") ||
+      desc.startsWith("modification instrument");
   }
 
   private mapRecordToActivity(record: DeGiroRecord, security?: YahooFinanceRecord, isTransactionFeeRecord: boolean = false): GhostfolioActivity {
@@ -395,8 +464,19 @@ export class DeGiroConverterV3 extends AbstractConverter {
       const totalAmount = parseFloat(record.amount.replace(",", "."));
       unitPrice = parseFloat((Math.abs(totalAmount) / numberShares).toFixed(3));
 
-      // If amount is negative (so money has been removed) or it's stock dividend (so free shares), thus it's a buy record.
-      if (totalAmount < 0 || record.description.toLocaleLowerCase().indexOf("stock dividend") > -1) {
+      // Detect buy vs sell.
+      // Money out (amount < 0)                  -> buy
+      // Stock dividend (free shares, amount=0)  -> buy
+      // Corporate action share receipts (Fusion / Rachat / Modification instrument)
+      //   emit an 'Achat N ...' row with amount=0 because no cash moves. Without
+      //   this branch, amount=0 falls into the SELL default and a share receipt is
+      //   inverted into a phantom SELL of the acquirer.
+      const desc = record.description.toLocaleLowerCase();
+      const isCorporateActionPrefix = desc.startsWith("fusion") ||
+        desc.startsWith("rachat") ||
+        desc.startsWith("modification instrument");
+      const isCorporateActionBuy = isCorporateActionPrefix && / achat /.test(desc);
+      if (totalAmount < 0 || desc.indexOf("stock dividend") > -1 || isCorporateActionBuy) {
         orderType = GhostfolioOrderType.buy;
       } else {
         orderType = GhostfolioOrderType.sell;
