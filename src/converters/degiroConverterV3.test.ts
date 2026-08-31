@@ -369,6 +369,52 @@ describe("degiroConverterV3", () => {
     }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
   });
 
+  it("should treat 'Changement ISIN' (ticker migration) as a cash-neutral SELL old + BUY new, not a phantom dividend (Atlassian case)", (done) => {
+
+    // Arrange: DeGiro emits an ISIN migration as two rows with orderId="": a Vente on the old
+    // ISIN and an Achat on the new ISIN, both at the same amount (cash-neutral). Without the
+    // corporate-action guard, the Vente row falls through to findMatchByIsin and pairs with an
+    // unrelated older BUY that happens to share the same ISIN, producing a phantom DIVIDEND.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    // DeGiro exports newest-first: migration day rows come BEFORE the older real BUY in file order.
+    tempFileContent += `03-10-2022,13:57,03-10-2022,ATLASSIAN CORP CLASS A,US0494681010,"Changement ISIN: Achat 2 Atlassian Corp Class A@210,59 USD (US0494681010)",,USD,"-421,18",USD,"0,00",\n`;
+    tempFileContent += `03-10-2022,13:57,03-10-2022,ATLASSIAN CORPORATION PLC,GB00BZ09BD16,"Changement ISIN: Vente 2 Atlassian Corporation PLC@210,59 USD (GB00BZ09BD16)",,USD,"421,18",USD,"421,18",\n`;
+    // Older real BUY on the old ISIN, months earlier, with its own orderId.
+    tempFileContent += `29-04-2022,17:06,29-04-2022,ATLASSIAN CORPORATION PLC,GB00BZ09BD16,"Achat 2 Atlassian Corporation PLC@240,65 USD (GB00BZ09BD16)",,USD,"-481,30",USD,"-481,30",f4ab9a94`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+    jest.spyOn((sut as any).securityService, "getSecurity").mockImplementation(() => Promise.resolve({ symbol: "TEAM", currency: "USD" } as any));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: no phantom dividend; SELL 2 old + BUY 2 new for the migration; original 29-04 BUY intact.
+      const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
+      expect(dividends.length).toBe(0);
+
+      const sells = actualExport.activities.filter(a => a.type === "SELL");
+      expect(sells.length).toBe(1);
+      expect(sells[0].quantity).toBe(2);
+      expect(sells[0].unitPrice).toBeCloseTo(210.59, 2);
+
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      // Two BUYs: the original 29-04 real trade, and the cash-neutral migration BUY at 210,59.
+      expect(buys.length).toBe(2);
+      const migrationBuy = buys.find(a => a.date.startsWith("2022-10-03"));
+      expect(migrationBuy).toBeTruthy();
+      expect(migrationBuy.quantity).toBe(2);
+      expect(migrationBuy.unitPrice).toBeCloseTo(210.59, 2);
+      const originalBuy = buys.find(a => a.date.startsWith("2022-04-29"));
+      expect(originalBuy).toBeTruthy();
+      expect(originalBuy.quantity).toBe(2);
+      expect(originalBuy.unitPrice).toBeCloseTo(240.65, 2);
+      expect(originalBuy.fee).toBeCloseTo(0, 2); // no fee row in this fixture
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
   it("should log error and invoke errorCallback when an error occurs in processFileContents", (done) => {
    
     // Arrange

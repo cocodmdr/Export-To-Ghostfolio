@@ -558,7 +558,8 @@ export class DeGiroConverterV3 extends AbstractConverter {
     const desc = record.description.toLocaleLowerCase();
     return desc.startsWith("fusion") ||
       desc.startsWith("rachat") ||
-      desc.startsWith("modification instrument");
+      desc.startsWith("modification instrument") ||
+      desc.startsWith("changement isin");
   }
 
   private mapRecordToActivity(record: DeGiroRecord, security?: YahooFinanceRecord, isTransactionFeeRecord: boolean = false): GhostfolioActivity {
@@ -587,7 +588,8 @@ export class DeGiroConverterV3 extends AbstractConverter {
       const desc = record.description.toLocaleLowerCase();
       const isCorporateActionPrefix = desc.startsWith("fusion") ||
         desc.startsWith("rachat") ||
-        desc.startsWith("modification instrument");
+        desc.startsWith("modification instrument") ||
+        desc.startsWith("changement isin");
       const isCorporateActionBuy = isCorporateActionPrefix && / achat /.test(desc);
       if (totalAmount < 0 || desc.indexOf("stock dividend") > -1 || isCorporateActionBuy) {
         orderType = GhostfolioOrderType.buy;
