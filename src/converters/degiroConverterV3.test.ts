@@ -290,9 +290,9 @@ describe("degiroConverterV3", () => {
     // and one €2 fee row. The fee must be split proportionally (7/8 and 1/8) so no fee is lost.
     let tempFileContent = "";
     tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
-    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-2,00",EUR,"4020,15",bbf89f72\n`;
-    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,"Achat 1 Krystal Biotech, Inc.@310 USD (US5011471027)",,USD,"-310,00",USD,"-2480,00",bbf89f72\n`;
-    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,"Achat 7 Krystal Biotech, Inc.@310 USD (US5011471027)",,USD,"-2170,00",USD,"-2170,00",bbf89f72`;
+    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-2,00",EUR,"4020,15",TEST-KRYS-1\n`;
+    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,"Achat 1 Krystal Biotech, Inc.@310 USD (US5011471027)",,USD,"-310,00",USD,"-2480,00",TEST-KRYS-1\n`;
+    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,"Achat 7 Krystal Biotech, Inc.@310 USD (US5011471027)",,USD,"-2170,00",USD,"-2170,00",TEST-KRYS-1`;
 
     const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
     jest.spyOn((sut as any).securityService, "getSecurity").mockImplementation(() => Promise.resolve({ symbol: "KRYS", currency: "USD" } as any));
@@ -323,9 +323,9 @@ describe("degiroConverterV3", () => {
     // Fee row at 18:40 must still attach to the 18:50 BUY (same orderId), not be orphaned.
     let tempFileContent = "";
     tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
-    tempFileContent += `06-11-2024,18:50,06-11-2024,MAPLEBEAR INC.,US5653941030,"Achat 45 Maplebear Inc.@47,5 USD (US5653941030)",,USD,"-2137,50",USD,"-2137,50",ae1679a1\n`;
-    tempFileContent += `06-11-2024,18:40,06-11-2024,MAPLEBEAR INC.,US5653941030,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-2,00",EUR,"2088,22",ae1679a1\n`;
-    tempFileContent += `06-11-2024,18:40,06-11-2024,MAPLEBEAR INC.,US5653941030,"Achat 2 Maplebear Inc.@47,5 USD (US5653941030)",,USD,"-95,00",USD,"-95,00",ae1679a1`;
+    tempFileContent += `06-11-2024,18:50,06-11-2024,MAPLEBEAR INC.,US5653941030,"Achat 45 Maplebear Inc.@47,5 USD (US5653941030)",,USD,"-2137,50",USD,"-2137,50",TEST-CART-1\n`;
+    tempFileContent += `06-11-2024,18:40,06-11-2024,MAPLEBEAR INC.,US5653941030,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-2,00",EUR,"2088,22",TEST-CART-1\n`;
+    tempFileContent += `06-11-2024,18:40,06-11-2024,MAPLEBEAR INC.,US5653941030,"Achat 2 Maplebear Inc.@47,5 USD (US5653941030)",,USD,"-95,00",USD,"-95,00",TEST-CART-1`;
 
     const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
     jest.spyOn((sut as any).securityService, "getSecurity").mockImplementation(() => Promise.resolve({ symbol: "CART", currency: "USD" } as any));
@@ -381,7 +381,7 @@ describe("degiroConverterV3", () => {
     tempFileContent += `03-10-2022,13:57,03-10-2022,ATLASSIAN CORP CLASS A,US0494681010,"Changement ISIN: Achat 2 Atlassian Corp Class A@210,59 USD (US0494681010)",,USD,"-421,18",USD,"0,00",\n`;
     tempFileContent += `03-10-2022,13:57,03-10-2022,ATLASSIAN CORPORATION PLC,GB00BZ09BD16,"Changement ISIN: Vente 2 Atlassian Corporation PLC@210,59 USD (GB00BZ09BD16)",,USD,"421,18",USD,"421,18",\n`;
     // Older real BUY on the old ISIN, months earlier, with its own orderId.
-    tempFileContent += `29-04-2022,17:06,29-04-2022,ATLASSIAN CORPORATION PLC,GB00BZ09BD16,"Achat 2 Atlassian Corporation PLC@240,65 USD (GB00BZ09BD16)",,USD,"-481,30",USD,"-481,30",f4ab9a94`;
+    tempFileContent += `29-04-2022,17:06,29-04-2022,ATLASSIAN CORPORATION PLC,GB00BZ09BD16,"Achat 2 Atlassian Corporation PLC@240,65 USD (GB00BZ09BD16)",,USD,"-481,30",USD,"-481,30",TEST-TEAM-1`;
 
     const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
     jest.spyOn((sut as any).securityService, "getSecurity").mockImplementation(() => Promise.resolve({ symbol: "TEAM", currency: "USD" } as any));
