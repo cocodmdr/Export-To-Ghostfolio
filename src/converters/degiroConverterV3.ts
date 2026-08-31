@@ -72,6 +72,12 @@ export class DeGiroConverterV3 extends AbstractConverter {
         // Populate the progress bar.
         const bar1 = this.progress.create(records.length, 0);
 
+        // Cache of pre-computed sibling fee shares. Populated when a fee row is paired
+        // with a buy/sell and there are multiple partial-fill siblings under the same
+        // orderId+day. When a later sibling iterates as standalone, it looks up its
+        // proportional slice here instead of emitting fee=0.
+        const siblingFeeShare = new Map<string, number>();
+
         for (let idx = 0; idx < records.length; idx++) {
           const record = records[idx];
 
@@ -140,6 +146,35 @@ export class DeGiroConverterV3 extends AbstractConverter {
               dataSource: "MANUAL",
               date: date.format("YYYY-MM-DDTHH:mm:ssZ"),
               symbol: `GF_${record.description}`,
+              tags: getTags()
+            });
+
+            bar1.increment(1);
+            continue;
+          }
+
+          // Manual FX broker fees: DeGiro emits '-10,00 EUR' broker fee rows on manual FX
+          // conversions with product='EUR/USD' and a placeholder ISIN like 'EURUSD......'.
+          // There is no real security to attach these to (no matching Achat/Vente row),
+          // so pairing fails and the row was silently dropped. Emit them as standalone FEE
+          // activities so the fee is visible in Ghostfolio.
+          if (this.isTransactionFeeRecord(record, true)
+              && record.isin && /^EURUSD\.+$/i.test(record.isin)) {
+
+            const feeAmount = Math.abs(parseFloat(record.amount.replace(",", ".")));
+            const date = dayjs(`${record.date} ${record.time}:00`, "DD-MM-YYYY HH:mm");
+
+            result.activities.push({
+              accountId: process.env.GHOSTFOLIO_ACCOUNT_ID,
+              comment: null,
+              fee: feeAmount,
+              quantity: 1,
+              type: GhostfolioOrderType.fee,
+              unitPrice: 0,
+              currency: record.currency,
+              dataSource: "MANUAL",
+              date: date.format("YYYY-MM-DDTHH:mm:ssZ"),
+              symbol: `GF_Manual FX fee (${record.product})`,
               tags: getTags()
             });
 
@@ -290,7 +325,17 @@ export class DeGiroConverterV3 extends AbstractConverter {
           if (!matchingRecord) {
 
             if (this.isBuyOrSellRecord(record)) {
-              result.activities.push(this.mapRecordToActivity(record, security));
+              const activity = this.mapRecordToActivity(record, security);
+              // Pick up a pre-computed proportional fee share left by an earlier
+              // fee-pair iteration (partial fill under same orderId+day).
+              if (record.orderId) {
+                const key = `${record.orderId}|${record.description}`;
+                if (siblingFeeShare.has(key)) {
+                  activity.fee = siblingFeeShare.get(key);
+                  siblingFeeShare.delete(key);
+                }
+              }
+              result.activities.push(activity);
             }
             else {
               result.activities.push(this.mapDividendRecord(record, null, security));
@@ -303,6 +348,47 @@ export class DeGiroConverterV3 extends AbstractConverter {
             // Check wether it is a buy/sell record set.
             if (this.isBuyOrSellRecordSet(record, matchingRecord)) {
               const activity = this.combineRecords(record, matchingRecord, security);
+
+              // Partial-fill fee split: if this fee is shared across multiple buy/sell
+              // siblings under the same orderId+day, split the fee proportionally by
+              // share count so no sibling ends up fee=0.
+              // Determine the fee row and the buy/sell action row of this pair.
+              const feeRow = this.isTransactionFeeRecord(record, true) ? record : matchingRecord;
+              const actionRow = feeRow === record ? matchingRecord : record;
+              // Find all buy/sell siblings under the same orderId+day (including actionRow itself).
+              // Look in the full record list, not just remaining, so earlier siblings
+              // (already emitted as standalone by an earlier iteration) are still counted.
+              const siblings = actionRow.orderId ? this.findBuySellSiblings(actionRow, records) : [actionRow];
+              if (siblings.length > 1) {
+                const totalFee = Math.abs(parseFloat(feeRow.amount.replace(",", ".")));
+                const totalQty = siblings.reduce((s, r) => s + this.parseSharesFromDescription(r), 0);
+                const actionQty = this.parseSharesFromDescription(actionRow);
+                if (totalQty > 0) {
+                  activity.fee = parseFloat(((totalFee * actionQty) / totalQty).toFixed(3));
+                  // Retro-apply to any already-emitted sibling activities, and forward-cache
+                  // the proportional share for siblings that will iterate later.
+                  for (const sib of siblings) {
+                    if (sib === actionRow) { continue; }
+                    const sibQty = this.parseSharesFromDescription(sib);
+                    const sibFee = parseFloat(((totalFee * sibQty) / totalQty).toFixed(3));
+                    let retroApplied = false;
+                    for (const emitted of result.activities) {
+                      if (emitted.comment && sib.orderId && emitted.comment.includes(sib.orderId)
+                          && emitted.quantity === sibQty
+                          && (emitted.type === GhostfolioOrderType.buy || emitted.type === GhostfolioOrderType.sell)
+                          && (emitted.fee || 0) === 0) {
+                        emitted.fee = sibFee;
+                        retroApplied = true;
+                        break;
+                      }
+                    }
+                    if (!retroApplied && sib.orderId) {
+                      siblingFeeShare.set(`${sib.orderId}|${sib.description}`, sibFee);
+                    }
+                  }
+                }
+              }
+
               // Tag the emitted activity with signatures for BOTH the current record
               // and the paired sibling so the dedup guard skips the sibling when its
               // own iteration comes (prevents double-emitting the Achat as standalone).
@@ -419,15 +505,42 @@ export class DeGiroConverterV3 extends AbstractConverter {
     // (e.g. a dividend-tax reversal getting paired with a corporate-action SELL
     // that shares the same isin+date+time).
     if (!currentRecord.orderId) { return undefined; }
+    // For fee↔buy/sell pairing we do NOT require exact time equality: DeGiro sometimes
+    // emits a later fill under the same orderId a few minutes after the fee row
+    // (e.g. fee at 18:40, second BUY at 18:50). Requiring same time would orphan
+    // that BUY. Same-time equality is only enforced when both sides are buy/sell
+    // rows, to keep partial-fill siblings independent.
+    const currentIsBuySell = this.isBuyOrSellRecord(currentRecord);
     return records.find(r => r.orderId === currentRecord.orderId
       && dayjs(r.date, "DD-MM-YYYY").isSame(dayjs(currentRecord.date, "DD-MM-YYYY"), 'day')
-      && r.time === currentRecord.time
       && !this.isIgnoredRecord(r)
-      // Don't pair two same-side buy/sell rows (partial fills sharing an orderId+time):
+      // Don't pair two same-side buy/sell rows (partial fills sharing an orderId):
       // each must be emitted as its own activity, otherwise combineRecords or
       // mapDividendRecord will drop one of them.
-      && !(this.isBuyOrSellRecord(currentRecord) && this.isBuyOrSellRecord(r))
+      && !(currentIsBuySell && this.isBuyOrSellRecord(r))
+      // Between two buy/sell rows enforce same time (unused today because of the
+      // guard above, but keep it defensive). For fee/tax↔buy pairing, same-day is enough.
+      && (currentIsBuySell || this.isBuyOrSellRecord(r) ? true : r.time === currentRecord.time)
     );
+  }
+
+  // Find all sibling buy/sell records (same orderId+description prefix, same day)
+  // so a single shared fee can be split proportionally by quantity across a partial fill.
+  private findBuySellSiblings(anchor: DeGiroRecord, allRecords: DeGiroRecord[]): DeGiroRecord[] {
+    if (!anchor.orderId || !this.isBuyOrSellRecord(anchor)) { return [anchor]; }
+    return allRecords.filter(r =>
+      r.orderId === anchor.orderId
+      && this.isBuyOrSellRecord(r)
+      && dayjs(r.date, "DD-MM-YYYY").isSame(dayjs(anchor.date, "DD-MM-YYYY"), 'day')
+      && r.isin === anchor.isin
+    );
+  }
+
+  private parseSharesFromDescription(record: DeGiroRecord): number {
+    try {
+      const m = record.description.match(/([\d*\.?\,?\d*]+)/);
+      return m ? parseFloat(m[0]) : 0;
+    } catch { return 0; }
   }
 
   private findMatchByIsin(currentRecord: DeGiroRecord, records: DeGiroRecord[]): DeGiroRecord | undefined {
@@ -445,7 +558,8 @@ export class DeGiroConverterV3 extends AbstractConverter {
     const desc = record.description.toLocaleLowerCase();
     return desc.startsWith("fusion") ||
       desc.startsWith("rachat") ||
-      desc.startsWith("modification instrument");
+      desc.startsWith("modification instrument") ||
+      desc.startsWith("changement isin");
   }
 
   private mapRecordToActivity(record: DeGiroRecord, security?: YahooFinanceRecord, isTransactionFeeRecord: boolean = false): GhostfolioActivity {
@@ -474,7 +588,8 @@ export class DeGiroConverterV3 extends AbstractConverter {
       const desc = record.description.toLocaleLowerCase();
       const isCorporateActionPrefix = desc.startsWith("fusion") ||
         desc.startsWith("rachat") ||
-        desc.startsWith("modification instrument");
+        desc.startsWith("modification instrument") ||
+        desc.startsWith("changement isin");
       const isCorporateActionBuy = isCorporateActionPrefix && / achat /.test(desc);
       if (totalAmount < 0 || desc.indexOf("stock dividend") > -1 || isCorporateActionBuy) {
         orderType = GhostfolioOrderType.buy;
