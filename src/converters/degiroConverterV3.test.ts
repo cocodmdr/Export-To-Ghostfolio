@@ -284,6 +284,91 @@ describe("degiroConverterV3", () => {
     }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
   });
 
+  it("should split a shared broker fee proportionally across partial-fill BUYs (KRYS case)", (done) => {
+
+    // Arrange: partial fill under one orderId at the same time — two BUY rows (1+7 shares)
+    // and one €2 fee row. The fee must be split proportionally (7/8 and 1/8) so no fee is lost.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-2,00",EUR,"4020,15",bbf89f72\n`;
+    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,"Achat 1 Krystal Biotech, Inc.@310 USD (US5011471027)",,USD,"-310,00",USD,"-2480,00",bbf89f72\n`;
+    tempFileContent += `12-05-2026,21:38,12-05-2026,"KRYSTAL BIOTECH, INC.",US5011471027,"Achat 7 Krystal Biotech, Inc.@310 USD (US5011471027)",,USD,"-2170,00",USD,"-2170,00",bbf89f72`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+    jest.spyOn((sut as any).securityService, "getSecurity").mockImplementation(() => Promise.resolve({ symbol: "KRYS", currency: "USD" } as any));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: both BUYs emitted, fee split proportionally, total fee sums to €2.
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(buys.length).toBe(2);
+      const totalFee = buys.reduce((s, a) => s + (a.fee || 0), 0);
+      expect(totalFee).toBeCloseTo(2, 2);
+      // Neither BUY may have a zero fee (both must carry their share).
+      expect(buys.every(a => (a.fee || 0) > 0)).toBe(true);
+      // Proportional: 7-share BUY carries 7/8 = 1.75, 1-share BUY carries 1/8 = 0.25.
+      const buy7 = buys.find(a => a.quantity === 7);
+      const buy1 = buys.find(a => a.quantity === 1);
+      expect(buy7.fee).toBeCloseTo(1.75, 2);
+      expect(buy1.fee).toBeCloseTo(0.25, 2);
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
+  it("should attach broker fee to a same-orderId BUY even when times differ (CART case)", (done) => {
+
+    // Arrange: DeGiro sometimes emits a second fill under the same orderId a few minutes later.
+    // Fee row at 18:40 must still attach to the 18:50 BUY (same orderId), not be orphaned.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `06-11-2024,18:50,06-11-2024,MAPLEBEAR INC.,US5653941030,"Achat 45 Maplebear Inc.@47,5 USD (US5653941030)",,USD,"-2137,50",USD,"-2137,50",ae1679a1\n`;
+    tempFileContent += `06-11-2024,18:40,06-11-2024,MAPLEBEAR INC.,US5653941030,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-2,00",EUR,"2088,22",ae1679a1\n`;
+    tempFileContent += `06-11-2024,18:40,06-11-2024,MAPLEBEAR INC.,US5653941030,"Achat 2 Maplebear Inc.@47,5 USD (US5653941030)",,USD,"-95,00",USD,"-95,00",ae1679a1`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+    jest.spyOn((sut as any).securityService, "getSecurity").mockImplementation(() => Promise.resolve({ symbol: "CART", currency: "USD" } as any));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: both BUYs emitted, the €2 fee is split proportionally 45/47 + 2/47 across them.
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(buys.length).toBe(2);
+      const totalFee = buys.reduce((s, a) => s + (a.fee || 0), 0);
+      expect(totalFee).toBeCloseTo(2, 2);
+      expect(buys.every(a => (a.fee || 0) > 0)).toBe(true);
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
+  it("should emit a standalone FEE activity for manual FX broker fees (EUR/USD case)", (done) => {
+
+    // Arrange: DeGiro emits '-10,00 EUR' broker fees on manual FX conversions with product=EUR/USD
+    // and a placeholder ISIN 'EURUSD......'. There is no real security, so pairing fails and the row
+    // was silently dropped. It must be emitted as a standalone FEE activity so the fee is visible.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `11-04-2024,21:55,11-04-2024,EUR/USD,EURUSD......,Frais DEGIRO de courtage et/ou de parties tierces,,EUR,"-10,00",EUR,"-4,48",`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      // Assert: exactly one FEE of €10, no BUYs/SELLs.
+      const fees = actualExport.activities.filter(a => a.type === "FEE");
+      expect(fees.length).toBe(1);
+      expect(fees[0].fee).toBeCloseTo(10, 2);
+      expect(fees[0].currency).toBe("EUR");
+      expect(actualExport.activities.filter(a => a.type === "BUY" || a.type === "SELL").length).toBe(0);
+
+      done();
+    }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
+  });
+
   it("should log error and invoke errorCallback when an error occurs in processFileContents", (done) => {
    
     // Arrange
