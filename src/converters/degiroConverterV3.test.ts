@@ -226,6 +226,42 @@ describe("degiroConverterV3", () => {
     }, (e) => { console.log(e); done(new Error("Should not have an error!")); });
   });
 
+  it("should convert a Dutch 'SPLIT AANPASSING' (stock split) pair into SELL old + BUY new", (done) => {
+
+    // Arrange: DeGiro NL emits stock splits with the same shape as the French export
+    // but a Dutch label 'SPLIT AANPASSING'. Example: NVIDIA 10-for-1 on 2024-06-10.
+    //   - Debit  : 'SPLIT AANPASSING: 80 NVIDIA @ 120,888 USD'   amount = -9671,04 USD
+    //   - Credit : 'SPLIT AANPASSING: 8 NVIDIA @ 1.208,88 USD'   amount = +9671,04 USD
+    // Before this fix, the Dutch label was not recognized so the debit fell through as SELL
+    // and the credit was silently dropped, leaving the user with a phantom SELL and stale
+    // share count.
+    let tempFileContent = "";
+    tempFileContent += "Datum,Tijd,Valutadatum,Product,ISIN,Omschrijving,FX,Mutatie,,Saldo,,Order Id\n";
+    tempFileContent += `10-06-2024,10:52,10-06-2024,NVIDIA CORPORATION,US67066G1040,"SPLIT AANPASSING: 80 NVIDIA Corporation @ 120,888 USD (US67066G1040)",,USD,"-9671,04",USD,"0,00",\n`;
+    tempFileContent += `10-06-2024,10:52,10-06-2024,NVIDIA CORPORATION,US67066G1040,"SPLIT AANPASSING: 8 NVIDIA Corporation @ 1.208,88 USD (US67066G1040)",,USD,"9671,04",USD,"9671,04",`;
+
+    const sut = new DeGiroConverterV3(new SecurityService(new YahooFinanceServiceMock()));
+
+    // Act
+    sut.processFileContents(tempFileContent, (actualExport: GhostfolioExport) => {
+
+      const dividends = actualExport.activities.filter(a => a.type === "DIVIDEND");
+      expect(dividends.length).toBe(0);
+
+      const sells = actualExport.activities.filter(a => a.type === "SELL");
+      const buys = actualExport.activities.filter(a => a.type === "BUY");
+      expect(sells.length).toBe(1);
+      expect(buys.length).toBe(1);
+
+      expect(sells[0].quantity).toBe(8);
+      expect(sells[0].unitPrice).toBeCloseTo(1208.88, 2);
+      expect(buys[0].quantity).toBe(80);
+      expect(buys[0].unitPrice).toBeCloseTo(120.888, 3);
+
+      done();
+    }, (e) => { console.log("ERR>", e && (e as any).stack || e); done(new Error("Should not have an error!")); });
+  });
+
   it("should handle acquisition/merger cash-neutral (Fusion: Achat @ 0) as BUY not SELL — TopBuild/QXO case", (done) => {
 
     // Arrange: when a company is acquired, DeGiro FR emits a 'Fusion: Achat' row for the

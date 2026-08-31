@@ -623,27 +623,34 @@ export class DeGiroConverterV3 extends AbstractConverter {
 
   private isStockSplitRecord(record: DeGiroRecord): boolean {
     if (!record || !record.description) return false;
-    const stockSplitMarkers = ["ajustement fractionnement", "stock split", "aktiensplit", "frazionamento"];
+    const stockSplitMarkers = ["ajustement fractionnement", "stock split", "aktiensplit", "frazionamento", "split aanpassing"];
     return stockSplitMarkers.some((t) => record.description.toLocaleLowerCase().indexOf(t) > -1);
   }
 
   private findSplitSibling(record: DeGiroRecord, remaining: DeGiroRecord[]): DeGiroRecord | null {
+    // Splits happen at most once per day per ISIN. Some DeGiro exports (e.g. Dutch
+    // 'SPLIT AANPASSING') timestamp the two legs a few minutes apart, so match on
+    // date + ISIN only rather than requiring identical times.
     return remaining.find(r =>
       r.isin === record.isin &&
       r.date === record.date &&
-      r.time === record.time &&
       this.isStockSplitRecord(r)) || null;
   }
 
   private parseSplitDescription(description: string): { qty: number; px: number } | null {
     // Match: "Ajustement fractionnement: 30 NVIDIA Corporation @ 120,888 USD (US67066G1040)"
     // Also:  "Ajustement fractionnement: 3 NVIDIA Corporation @ 1 208,88 USD (US67066G1040)"
+    // Also:  "SPLIT AANPASSING: 8 NVIDIA Corporation @ 1.208,88 USD (US67066G1040)" (Dutch: '.' thousands, ',' decimal)
     // Quantity is the first integer, price is the number after '@' (allowing thin/regular spaces
-    // as thousands separators and comma as decimal separator).
+    // or periods as thousands separators and comma as decimal separator).
     const m = description.match(/:\s*([0-9]+)\s.+@\s*([0-9\s\u00A0.,]+?)\s+[A-Z]{3}/);
     if (!m) return null;
     const qty = parseInt(m[1], 10);
-    const pxStr = m[2].replace(/[\s\u00A0]/g, "").replace(",", ".");
+    // Normalise European number: strip spaces and dot thousands separators, then convert comma to dot.
+    let pxStr = m[2].replace(/[\s\u00A0]/g, "");
+    if (pxStr.indexOf(",") !== -1) {
+      pxStr = pxStr.replace(/\./g, "").replace(",", ".");
+    }
     const px = parseFloat(pxStr);
     if (isNaN(qty) || isNaN(px)) return null;
     return { qty, px };
