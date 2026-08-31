@@ -404,6 +404,14 @@ export class DeGiroConverterV3 extends AbstractConverter {
       "levantamento de divisa",
       "dito de divisa",
       "fonds monétaires",
+      // Money market fund sweep (Dutch): DeGiro NL internally parks idle EUR cash in
+      // Morgan Stanley EUR Liquidity Fund and emits daily NAV changes
+      // ('Koersverandering geldmarktfonds') plus sweep in/out
+      // ('Conversie geldmarktfonds: Koop/Verkoop'). None represent real trades
+      // or dividends — they're bookkeeping noise that would otherwise produce
+      // hundreds of phantom DIVIDEND rows with null unitPrice/currency, which
+      // Ghostfolio import rejects.
+      "geldmarktfonds",
       // 'Modification instrument' rows are internal bookkeeping (e.g. a ticker/ISIN
       // rename or a 'non tradeable' variant swap) that DeGiro emits as a paired
       // Achat + Vente at price 0. They never move cash or change your real
